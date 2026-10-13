@@ -51,6 +51,20 @@ jobs:
           sudo apt-get install -y devscripts config-package-dev debhelper equivs
           sudo tools/buildutils/installbazel.sh
 
+      # Ubuntu 22.04 GitHub runners preinstall LLVM libunwind-14-dev,
+      # which conflicts with the GNU libunwind-dev required by glog.
+      # Explicitly requesting both runtime build dependencies makes apt
+      # resolve that conflict on this DISPOSABLE runner, before mk-build-deps.
+      - name: Resolve Jammy libunwind and glog build dependency conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== APT resolver plan (runner only) ==='
+          sudo apt-get -s install --no-install-recommends libunwind-dev libgoogle-glog-dev
+          echo '=== Install explicitly requested build dependencies ==='
+          sudo apt-get install -y --no-install-recommends libunwind-dev libgoogle-glog-dev
+          dpkg-query -W -f='${Package} ${Version}\n' libunwind-dev libgoogle-glog-dev
+
       - name: Build cuttlefish-base on native Jammy
         shell: bash
         run: |
@@ -76,7 +90,7 @@ jobs:
           fi
           cp -- "$pkg" verified-base/
           git rev-parse HEAD > verified-base/upstream-commit.txt
-          sha256sum verified-base/*.deb > verified-base/SHA256SUMS
+          ( cd verified-base && sha256sum -- *.deb > SHA256SUMS )
           echo 'PASS: native Jammy build; capability file present; local apt simulation succeeded.'
 
       - name: Upload verified cuttlefish-base
@@ -119,7 +133,7 @@ jobs:
           fi
           cp -- "${bases[0]}" "${users[0]}" verified-web-ui/
           git rev-parse HEAD > verified-web-ui/upstream-commit.txt
-          sha256sum verified-web-ui/*.deb > verified-web-ui/SHA256SUMS
+          ( cd verified-web-ui && sha256sum -- *.deb > SHA256SUMS )
           echo 'PASS: native Jammy build; combined local apt simulation succeeded.'
 
       - name: Upload verified base + WebRTC user packages
