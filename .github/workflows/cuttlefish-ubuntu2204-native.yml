@@ -61,7 +61,7 @@ jobs:
           # Jammy-host build compatibility: uuid 1.28.0 requires rustc >=1.89
           # for const eq_ignore_ascii_case; Bazel owns its own rustc selection.
           rust_compiler_jammy = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-          rust_compiler_jammy.toolchain(versions = ["1.89.0"])
+          rust_compiler_jammy.toolchain(versions = ["1.89.0"], edition = "2021")
           use_repo(rust_compiler_jammy, "rust_toolchains")
           register_toolchains("@rust_toolchains//:all")
           '''
