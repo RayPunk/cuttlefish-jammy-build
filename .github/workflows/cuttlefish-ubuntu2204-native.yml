@@ -91,15 +91,73 @@ jobs:
           sudo apt-get install -y --no-install-recommends libunwind-dev libgoogle-glog-dev
           dpkg-query -W -f='${Package} ${Version}\n' libunwind-dev libgoogle-glog-dev
 
-      # Disk cache contains Bazel action outputs and is transferred by GitHub
-      # Actions. It cannot resurrect outputs from the earlier uncached V2 run.
+      # Use a NEW cache namespace for the V4L2 UAPI layout fix. Bazel build.rs
+      # reads the host kernel header, which may not be a declared action input.
+      # Reusing V4 cached Rust bindings could retain the obsolete reserved[1].
+      - name: Install Cuttlefish base build dependencies before targeted Rust preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd base && sudo mk-build-deps -i -t 'apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y' )
+
+      # Jammy's 5.15-era UAPI has __u32 reserved[1] in this ABI position.
+      # The virtio-media 0.0.7 Rust code expects the later equivalent fields
+      # __u8 flags + __u8 reserved[3]. The 20-byte struct layout is unchanged.
+      # Only modify the disposable GitHub runner's host header, NOT users' PCs
+      # and NOT any kernel/libc package; fail if the actual layout differs.
+      - name: Adapt V4L2 requestbuffers UAPI on disposable Jammy runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          p = Path('/usr/include/linux/videodev2.h')
+          src = p.read_text()
+          pattern = r'struct\s+v4l2_requestbuffers\s*\{(?P<body>.*?)\n\};'
+          m = re.search(pattern, src, re.S)
+          if m is None:
+              raise SystemExit('Unexpected videodev2.h: struct missing')
+          body = m.group('body')
+          for field in ('count', 'type', 'memory', 'capabilities'):
+              if not re.search(r'__u32\s+' + field + r'\s*;', body):
+                  raise SystemExit('Unexpected requestbuffers ABI field: ' + field)
+          if re.search(r'__u8\s+flags\s*;', body) and re.search(r'__u8\s+reserved\s*\[\s*3\s*\]\s*;', body):
+              print('V4L2_UAPI=ALREADY_COMPATIBLE')
+          else:
+              old = r'__u32\s+reserved\s*\[\s*1\s*\]\s*;'
+              if not re.search(old, body) or re.search(r'\bflags\s*;', body):
+                  raise SystemExit('Unknown requestbuffers ABI; refusing header edit')
+              body_new, count = re.subn(old, '__u8 flags;\n\t__u8 reserved[3];', body)
+              assert count == 1
+              dst = Path('/tmp/cuttlefish-videodev2-jammy-compat.h')
+              dst.write_text(src[:m.start('body')] + body_new + src[m.end('body'):])
+              print('V4L2_UAPI=PATCHED_SAME_ABI')
+          PYCODE
+          if test -f /tmp/cuttlefish-videodev2-jammy-compat.h; then
+            sudo cp -a /usr/include/linux/videodev2.h /tmp/cuttlefish-videodev2.original.h
+            sudo install -m 0644 /tmp/cuttlefish-videodev2-jammy-compat.h /usr/include/linux/videodev2.h
+          fi
+          cat >/tmp/cuttlefish-v4l2-abi.c <<'C'
+          #include <stddef.h>
+          #include <time.h>
+          #include <linux/videodev2.h>
+          _Static_assert(sizeof(struct v4l2_requestbuffers) == 20, "V4L2 requestbuffers ABI size changed");
+          _Static_assert(offsetof(struct v4l2_requestbuffers, flags) == 16, "V4L2 flags offset wrong");
+          _Static_assert(offsetof(struct v4l2_requestbuffers, reserved) == 17, "V4L2 reserved offset wrong");
+          int main(void) { return 0; }
+          C
+          cc -std=c11 -Wall -Wextra -Werror /tmp/cuttlefish-v4l2-abi.c -o /tmp/cuttlefish-v4l2-abi
+          /tmp/cuttlefish-v4l2-abi
+          echo 'V4L2_ABI_PREFLIGHT=PASS'
+
       - name: Restore prior Bazel disk cache
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/cuttlefish-bazel
-          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-${{ github.run_id }}
+          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-v4l2abi-${{ github.run_id }}
           restore-keys: |
-            cf-jammy-${{ inputs.upstream_ref }}-rust189-
+            cf-jammy-${{ inputs.upstream_ref }}-rust189-v4l2abi-
 
       - name: Initialize Bazel cache and check registered toolchains
         shell: bash
@@ -110,6 +168,36 @@ jobs:
           echo 'Bazel rust toolchains:'
           head -20 /tmp/cuttlefish-rust-toolchains.txt
           grep -q 'rust_toolchain' /tmp/cuttlefish-rust-toolchains.txt || { echo 'Rust toolchains missing'; exit 1; }
+
+      # Compile the EXACT crate that previously failed before embarking on
+      # the expensive full Cuttlefish host package build. Do not let a failed
+      # media preflight fall through to 22k Bazel actions.
+      - name: Preflight compile of virtio-media 0.0.7 with corrected V4L2 UAPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd base/cvd && bazel build \
+              --disk_cache="$HOME/.cache/cuttlefish-bazel" \
+              --spawn_strategy=local -c opt \
+              '@@rules_rust++crate+vhost_user_media_workspace_crates__virtio-media-0.0.7//:virtio_media' )
+          echo 'VIRTIO_MEDIA_PREFLIGHT=PASS'
+
+      # Do not stop at the first independent Bazel compilation failure again.
+      # --keep_going is diagnostic only; Bazel still exits nonzero if any
+      # target fails, so no unverified Debian package can be uploaded.
+      - name: Collect all independent Bazel compiler errors in full build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('base/debian/rules')
+          src = p.read_text()
+          old = 'cd cvd && bazel build ${remote_cache_arg}'
+          assert src.count(old) == 1, 'Unexpected upstream Bazel invocation'
+          p.write_text(src.replace(old, 'cd cvd && bazel build --keep_going --verbose_failures ${remote_cache_arg}'))
+          PYCODE
+          git diff -- base/debian/rules
 
       - name: Build cuttlefish-base on native Jammy
         shell: bash
@@ -147,7 +235,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/cuttlefish-bazel
-          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-${{ github.run_id }}
+          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-v4l2abi-${{ github.run_id }}
 
       - name: Verify base package against Ubuntu 22.04 apt dependencies
         shell: bash
@@ -168,8 +256,14 @@ jobs:
           fi
           cp -- "$pkg" verified-base/
           git rev-parse HEAD > verified-base/upstream-commit.txt
-          git diff -- base/cvd/toolchain/rust.MODULE.bazel > verified-base/jammy-rust-toolchain.patch
-          test -s verified-base/jammy-rust-toolchain.patch
+          git diff -- base/cvd/toolchain/rust.MODULE.bazel base/debian/rules > verified-base/jammy-ci-build.patch
+          test -s verified-base/jammy-ci-build.patch
+          printf '%s\n' \
+            'Build: native Ubuntu 22.04 amd64' \
+            'Rust: 1.89.0 / edition 2021' \
+            'Build-only UAPI adaptation: Linux 5.15 v4l2_requestbuffers reserved[1] -> flags + reserved[3] (ABI size/offset checked)' \
+            'Not an upstream/source or installed-host library modification' \
+            > verified-base/BUILD_COMPATIBILITY.txt
           ( cd verified-base && sha256sum -- *.deb > SHA256SUMS )
           echo 'PASS: native Jammy build; capability file present; local apt simulation succeeded.'
 
