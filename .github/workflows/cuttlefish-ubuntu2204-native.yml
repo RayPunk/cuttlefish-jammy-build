@@ -1,0 +1,132 @@
+name: Cuttlefish Host - native Ubuntu 22.04
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Google android-cuttlefish release tag (native Jammy compatibility is NOT presumed)'
+        type: string
+        required: true
+        default: 'v1.57.0'
+      include_web_ui:
+        description: 'Also build cuttlefish-user (WebRTC browser UI)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-jammy-amd64:
+    name: Build and check amd64 packages on Jammy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout public upstream at selected tag
+        uses: actions/checkout@v4
+        with:
+          repository: google/android-cuttlefish
+          ref: ${{ inputs.upstream_ref }}
+          persist-credentials: false
+
+      - name: Confirm native Ubuntu 22.04 build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+          echo "OS=$PRETTY_NAME ARCH=$(dpkg --print-architecture)"
+          test "$VERSION_ID" = '22.04'
+          test "$(dpkg --print-architecture)" = 'amd64'
+          dpkg-query -W -f='${Package} ${Version}\n' libc6
+          git rev-parse HEAD
+
+      # All sudo/apt and network operations below run on DISPOSABLE GitHub
+      # infrastructure. No command in this workflow touches the user's PC.
+      - name: Prepare build tools and Bazelisk on GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y devscripts config-package-dev debhelper equivs
+          sudo tools/buildutils/installbazel.sh
+
+      - name: Build cuttlefish-base on native Jammy
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/buildutils/build_package.sh "$PWD/base"
+
+      - name: Verify base package against Ubuntu 22.04 apt dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(cuttlefish-base_*_amd64.deb)
+          test "${#files[@]}" -eq 1
+          pkg="${files[0]}"
+          mkdir -p verified-base
+          dpkg-deb -f "$pkg" Package Version Architecture Depends > verified-base/base-metadata.txt
+          dpkg-deb -c "$pkg" > verified-base/base-filelist.txt
+          grep -Fq '/usr/lib/cuttlefish-common/bin/capability_query.py' verified-base/base-filelist.txt
+          apt-get -s install "./$pkg" > verified-base/apt-simulation.txt
+          if grep -Eq '^Remv ' verified-base/apt-simulation.txt; then
+            echo 'ERROR: APT simulation would remove packages.' >&2
+            exit 1
+          fi
+          cp -- "$pkg" verified-base/
+          git rev-parse HEAD > verified-base/upstream-commit.txt
+          sha256sum verified-base/*.deb > verified-base/SHA256SUMS
+          echo 'PASS: native Jammy build; capability file present; local apt simulation succeeded.'
+
+      - name: Upload verified cuttlefish-base
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuttlefish-base-jammy22-amd64
+          path: verified-base/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Install Go for WebRTC frontend build
+        if: ${{ inputs.include_web_ui }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+
+      - name: Build cuttlefish-user frontend on native Jammy
+        if: ${{ inputs.include_web_ui }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/buildutils/build_package.sh "$PWD/frontend"
+
+      - name: Verify combined base + user installation plan
+        if: ${{ inputs.include_web_ui }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bases=(cuttlefish-base_*_amd64.deb)
+          users=(cuttlefish-user_*_amd64.deb)
+          test "${#bases[@]}" -eq 1
+          test "${#users[@]}" -eq 1
+          mkdir -p verified-web-ui
+          dpkg-deb -f "${users[0]}" Package Version Architecture Depends > verified-web-ui/user-metadata.txt
+          apt-get -s install "./${bases[0]}" "./${users[0]}" > verified-web-ui/apt-simulation.txt
+          if grep -Eq '^Remv ' verified-web-ui/apt-simulation.txt; then
+            echo 'ERROR: APT simulation would remove packages.' >&2
+            exit 1
+          fi
+          cp -- "${bases[0]}" "${users[0]}" verified-web-ui/
+          git rev-parse HEAD > verified-web-ui/upstream-commit.txt
+          sha256sum verified-web-ui/*.deb > verified-web-ui/SHA256SUMS
+          echo 'PASS: native Jammy build; combined local apt simulation succeeded.'
+
+      - name: Upload verified base + WebRTC user packages
+        if: ${{ inputs.include_web_ui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuttlefish-base-user-jammy22-amd64
+          path: verified-web-ui/
+          if-no-files-found: error
+          retention-days: 30
