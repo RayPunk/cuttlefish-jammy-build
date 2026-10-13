@@ -21,7 +21,7 @@ jobs:
   build-jammy-amd64:
     name: Build and check amd64 packages on Jammy
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - name: Checkout public upstream at selected tag
         uses: actions/checkout@v4
@@ -43,6 +43,32 @@ jobs:
 
       # All sudo/apt and network operations below run on DISPOSABLE GitHub
       # infrastructure. No command in this workflow touches the user's PC.
+      # The selected upstream tag brings uuid 1.28.0 into the media Rust graph.
+      # Rust <1.89 cannot use eq_ignore_ascii_case in a const fn. Select the
+      # Bazel-managed Rust toolchain, NOT merely the runner's PATH rustc.
+      - name: Pin Bazel-managed Rust toolchain to 1.89.0 (runner checkout only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('base/cvd/toolchain/rust.MODULE.bazel')
+          source = p.read_text()
+          assert 'rust_host_tools = use_extension(' in source, 'unexpected upstream Rust module layout'
+          assert 'register_toolchains("@rust_toolchains//:all")' not in source, 'Rust toolchain registration already exists; inspect instead'
+          extra = '''
+
+          # Jammy-host build compatibility: uuid 1.28.0 requires rustc >=1.89
+          # for const eq_ignore_ascii_case; Bazel owns its own rustc selection.
+          rust_compiler_jammy = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+          rust_compiler_jammy.toolchain(versions = ["1.89.0"])
+          use_repo(rust_compiler_jammy, "rust_toolchains")
+          register_toolchains("@rust_toolchains//:all")
+          '''
+          p.write_text(source.rstrip() + '\n' + extra)
+          PYCODE
+          git diff -- base/cvd/toolchain/rust.MODULE.bazel
+
       - name: Prepare build tools and Bazelisk on GitHub runner
         shell: bash
         run: |
@@ -65,11 +91,63 @@ jobs:
           sudo apt-get install -y --no-install-recommends libunwind-dev libgoogle-glog-dev
           dpkg-query -W -f='${Package} ${Version}\n' libunwind-dev libgoogle-glog-dev
 
+      # Disk cache contains Bazel action outputs and is transferred by GitHub
+      # Actions. It cannot resurrect outputs from the earlier uncached V2 run.
+      - name: Restore prior Bazel disk cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/cuttlefish-bazel
+          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-${{ github.run_id }}
+          restore-keys: |
+            cf-jammy-${{ inputs.upstream_ref }}-rust189-
+
+      - name: Initialize Bazel cache and check registered toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/cuttlefish-bazel"
+          (cd base/cvd && bazel query '@rust_toolchains//:all' >/tmp/cuttlefish-rust-toolchains.txt)
+          echo 'Bazel rust toolchains:'
+          head -20 /tmp/cuttlefish-rust-toolchains.txt
+          grep -q 'rust_toolchain' /tmp/cuttlefish-rust-toolchains.txt || { echo 'Rust toolchains missing'; exit 1; }
+
       - name: Build cuttlefish-base on native Jammy
         shell: bash
         run: |
           set -euo pipefail
-          tools/buildutils/build_package.sh "$PWD/base"
+          tools/buildutils/build_package.sh "$PWD/base" -d "$HOME/.cache/cuttlefish-bazel"
+
+      # This pair runs even when the compilation fails, so later runs can
+      # recover whichever outputs made it into the Bazel disk cache. Caching
+      # may be skipped if it exceeds this repo's manageable cache budget.
+      - name: Check whether Bazel disk cache fits GitHub cache budget
+        if: ${{ always() }}
+        id: bazel_cache_budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$HOME/.cache/cuttlefish-bazel"
+          if [[ ! -d "$dir" ]]; then
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          size_kib=$(du -sk "$dir" | awk '{print $1}')
+          echo "Bazel disk cache: $size_kib KiB"
+          if (( size_kib > 6291456 )); then
+            echo 'Cache > 6 GiB; skipping GitHub upload (preserves CI time/quota)'
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+          elif (( size_kib == 0 )); then
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'save=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save Bazel action cache even after a failed build
+        if: ${{ always() && steps.bazel_cache_budget.outputs.save == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/cuttlefish-bazel
+          key: cf-jammy-${{ inputs.upstream_ref }}-rust189-${{ github.run_id }}
 
       - name: Verify base package against Ubuntu 22.04 apt dependencies
         shell: bash
@@ -90,6 +168,8 @@ jobs:
           fi
           cp -- "$pkg" verified-base/
           git rev-parse HEAD > verified-base/upstream-commit.txt
+          git diff -- base/cvd/toolchain/rust.MODULE.bazel > verified-base/jammy-rust-toolchain.patch
+          test -s verified-base/jammy-rust-toolchain.patch
           ( cd verified-base && sha256sum -- *.deb > SHA256SUMS )
           echo 'PASS: native Jammy build; capability file present; local apt simulation succeeded.'
 
